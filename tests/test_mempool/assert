@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+import subprocess
+import sh
+import time
+import sys
+import os
+from glob import glob
+
+class TestMempool:
+    def setup_class(self):
+        print("Memory allocate test")
+        sh.echo(2000000, _out="/proc/sys/kernel/pid_max")
+        subprocess.Popen("ulimit unlimited", shell=True)
+        self.cpu_num = int(subprocess.check_output("nproc", shell=True).split()[0])
+
+    def test_all(self):
+        self.create_task_group()
+        self.check_refcount()
+        self.check_group_create_finish()
+        self.remove_task_group()
+        self.check_refcount()
+
+    def remove_task_group(self):
+        for i in range(1, 1000):
+            cmd = "rmdir /sys/fs/cgroup/cpu/" + str(i)
+            subprocess.Popen(cmd, shell=True)
+
+    def check_group_create_finish(self):
+        while not os.path.exists("/sys/fs/cgroup/cpu/999"):
+            time.sleep(1)
+
+    def check_refcount(self):
+        self.load_scheduler()
+        time.sleep(1)
+        self.unload_scheduler()
+        tg_refcount = self.get_count("tg_refcount")
+        cfsrq_refcount = self.get_count("cfsrq_refcount")
+        if tg_refcount != 0 or cfsrq_refcount != 0:
+            self.error_handler()
+
+    def get_count(self, var):
+        cmd = "dmesg | grep " + var + " | tail -1 | awk '{print $NF}'"
+        return int(subprocess.check_output(cmd, shell=True).split())
+
+    def create_task_group(self):
+        for i in range(1, 1000):
+            cmd = "mkdir -p /sys/fs/cgroup/cpu/" + str(i)
+            subprocess.Popen(cmd, shell=True)
+
+    def load_scheduler(self):
+        scheduler_rpm = glob(os.path.join('/tmp/work', 'scheduler*.rpm'))
+        if len(scheduler_rpm) != 1:
+            print("Please check your scheduler rpm");
+            self.teardown_class()
+            sys.exit(1)
+        scheduler_rpm = scheduler_rpm[0]
+        sh.rpm('-ivh', scheduler_rpm)
+
+    def unload_scheduler(self):
+        tmp = subprocess.Popen("lsmod | grep scheduler", shell=True, stdout=subprocess.PIPE)
+        if tmp.stdout.read() != b'':
+            sh.rpm('-e', 'scheduler-xxx')
+
+    def error_handler(self):
+        self.unload_scheduler()
+        print("Memory allocate test " + "\033[31mFAILED\033[0m")
+        sys.exit(1)
+
+    def teardown_class(self):
+        pass

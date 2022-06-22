@@ -1,0 +1,274 @@
+From 6701d838a2f292de095f6dc51484233f38e72664 Mon Sep 17 00:00:00 2001
+From: root <root@localhost.localdomain>
+Date: Wed, 22 Jun 2022 10:26:41 -0400
+Subject: [PATCH] test: mempool
+
+---
+ include/linux/sched.h      | 12 +++++++++
+ kernel/sched/mod/Makefile  |  2 +-
+ kernel/sched/mod/core.c    | 31 ++++++++++++++++++++++-
+ kernel/sched/mod/fair.c    |  2 +-
+ kernel/sched/mod/main.c    |  3 +++
+ kernel/sched/mod/mempool.h | 52 ++++++++++++++++++++++++++++++++++++--
+ kernel/sched/sched.h       |  4 +--
+ 7 files changed, 99 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index c2d7745e6..46c859c73 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -30,7 +30,19 @@
+ #include <linux/rseq.h>
+ 
+ #include <linux/ali_hotfix.h>
++struct tg_pad {
++        int                             test1;
++        unsigned long                   test2;
++        char                            test3[10];
++        void                            *test4;
++};
+ 
++struct cfsrq_pad {
++        int                             test1;
++        unsigned long                   test2;
++        char                            test3[10];
++        void                            *test4;
++};
+ /* task_struct member predeclarations (sorted alphabetically): */
+ struct audit_context;
+ struct backing_dev_info;
+diff --git a/kernel/sched/mod/Makefile b/kernel/sched/mod/Makefile
+index 292d158ea..16c5c9597 100644
+--- a/kernel/sched/mod/Makefile
++++ b/kernel/sched/mod/Makefile
+@@ -38,7 +38,7 @@ obj-stubs := $(patsubst %.o,%.stub.o,$(objs-y))
+ scheduler-objs := $(obj-stubs) main.o sched_rebuild.o
+ 
+ ldflags-y += -T $(plugsched_modpath)/scheduler.lds
+-ccflags-n += -DSCHEDMOD_MEMPOOL
++ccflags-y += -DSCHEDMOD_MEMPOOL
+ ccflags-y += -Wno-unused-function
+ ccflags-y += -DSPRINGBOARD=659
+ ccflags-y += -DSTACKSIZE_SCHEDULE=0x20
+diff --git a/kernel/sched/mod/core.c b/kernel/sched/mod/core.c
+index de28d3b5a..8320c3cb8 100644
+--- a/kernel/sched/mod/core.c
++++ b/kernel/sched/mod/core.c
+@@ -5643,6 +5643,7 @@ static void sched_free_group(struct task_group *tg)
+ 	kmem_cache_free(task_group_cache, tg);
+ }
+ 
++extern atomic_t tg_refcount;
++extern atomic_t cfsrq_refcount;
+ /* allocate runqueue etc for a new task group */
+ struct task_group *sched_create_group(struct task_group *parent)
+ {
+@@ -5677,6 +5678,26 @@ void sched_online_group(struct task_group *tg, struct task_group *parent)
+ 	WARN_ON(!parent);
+ 
+ 	tg->parent = parent;
++
++#ifdef SCHEDMOD_MEMPOOL
++	int cpu;
++	tg->extrapad = kzalloc(sizeof(struct tg_pad), GFP_KERNEL);
++	atomic_inc(&tg_refcount);
++	((struct tg_pad *)tg->extrapad)->test1 = -123;
++	((struct tg_pad *)tg->extrapad)->test2 = 456;
++	memcpy(((struct tg_pad *)tg->extrapad)->test3, "Hello", 5)
++	((struct tg_pad *)tg->extrapad)->test4 = NULL;
++	for_each_possible_cpu(cpu) {
++	    tg->cfs_rq[cpu]->extrapad = kzalloc_node(sizeof(struct cfs_rq),
++                                          GFP_KERNEL, cpu_to_node(i));
++	    atomic_inc(&cfsrq_refcount);
++	    ((struct cfsrq_pad *)tg->cfs_rq[cpu]->extrapad)->test1 = -123;
++	    ((struct cfsrq_pad *)tg->cfs_rq[cpu]->extrapad)->test2 = 456;
++	    memcpy(((struct cfsrq_pad *)tg->cfs_rq[cpu]->extrapad)->test3, "Hello", 5);
++	    ((struct cfsrq_pad *)tg->cfs_rq[cpu]->extrapad)->test4 = NULL;
++	}
++#endif
++
+ 	INIT_LIST_HEAD(&tg->children);
+ 	list_add_rcu(&tg->siblings, &parent->children);
+ 	spin_unlock_irqrestore(&task_group_lock, flags);
+@@ -5701,7 +5722,7 @@ void sched_destroy_group(struct task_group *tg)
+ 	call_rcu(&tg->rcu, sched_free_group_rcu);
+ }
+ /* DON'T MODIFY SIGNATURE OF FUNCTION sched_destroy_group, IT'S INTERFACE FUNCTION */
+-
++extern atomic_t cfsrq_refcount;
+ void sched_offline_group(struct task_group *tg)
+ {
+ 	unsigned long flags;
+@@ -5713,6 +5734,14 @@ void sched_offline_group(struct task_group *tg)
+ 	list_del_rcu(&tg->list);
+ 	list_del_rcu(&tg->siblings);
+ 	spin_unlock_irqrestore(&task_group_lock, flags);
++
++#ifdef SCHEDMOD_MEMPOOL
++	release_tg_reserve(tg);
++        for (cpu = 0; cpu < nr_cpu_ids; cpu ++) {
++               release_cfsrq_reserve(tg->cfs_rq[cpu]);
++        }
++      
++#endif
+ }
+ /* DON'T MODIFY SIGNATURE OF FUNCTION sched_offline_group, IT'S INTERFACE FUNCTION */
+ 
+diff --git a/kernel/sched/mod/fair.c b/kernel/sched/mod/fair.c
+index 66a90de94..4115935b0 100644
+--- a/kernel/sched/mod/fair.c
++++ b/kernel/sched/mod/fair.c
+@@ -10167,7 +10167,7 @@ void free_fair_sched_group(struct task_group *tg)
+ 
+ 	__free_fair_sched_group(tmp);
+ }
+-
++extern atomic_t cfsrq_refcount;
+ int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
+ {
+ 	struct sched_entity *se;
+diff --git a/kernel/sched/mod/main.c b/kernel/sched/mod/main.c
+index 98e2bff5a..33b1e5029 100644
+--- a/kernel/sched/mod/main.c
++++ b/kernel/sched/mod/main.c
+@@ -418,6 +418,9 @@ static int unload_sched_routine(void)
+ 	sched_mempools_destroy();
+ 	main_end = ktime_get();
+ 	report_detail_time("unload");
++	
++	printk("plugsched: tg_refcount is %d\n", atomic_read(&tg_refcount));
++	printk("plugsched: cfsrq_refcount is %d\n", atomic_read(&cfsrq_refcount));
+ 
+ 	module_put(THIS_MODULE);
+ 	scheduler_enable = 0;
+diff --git a/kernel/sched/mod/mempool.h b/kernel/sched/mod/mempool.h
+index 55c844766..45df94c28 100644
+--- a/kernel/sched/mod/mempool.h
++++ b/kernel/sched/mod/mempool.h
+@@ -7,6 +7,9 @@
+ 
+ #include <linux/percpu.h>
+ 
++atomic_t tg_refcount = ATOMIC_INIT(0);
++atomic_t cfsrq_refcount = ATOMIC_INIT(0);
++
+ #define is_simple_mempool_addr(smpool, addr) \
+ 	((unsigned long)(addr) >= (smpool)->vstart && \
+ 	 (unsigned long)(addr) <= (smpool)->vend)
+@@ -168,8 +171,10 @@ static inline bool is_simple_percpu_mempool_addr(
+ struct simple_mempool *name##_smp = NULL;				\
+ void release_##name##_reserve(struct type *x)				\
+ {									\
+-	if (!is_simple_mempool_addr(name##_smp, x->field))		\
++	if (!is_simple_mempool_addr(name##_smp, x->field)) {		\
+ 		kfree(x->field);					\
++		atomic_dec(& name##_refcount);				\
++	}								\
+ 	x->field = NULL;						\
+ }									\
+ FIELD_TYPE(type, field) alloc_##name##_reserve(void)			\
+@@ -241,6 +246,18 @@ static int recheck_mempool_##name(void) 				\
+  * 		nr_threads + nr_cpu_ids,//  we need exactly nr_cpu_ids objects
+  * 		nr_threads + nr_cpu_ids)// we alloc nr_cpu_ids objects before stop_machine
+  */
++#define nr_tgs atomic_read(&cpu_cgrp_subsys.root->nr_cgrps)
++
++DEFINE_RESERVE(cfs_rq,           
++               extrapad,            
++	            cfsrq,             
++               nr_tgs * nr_cpu_ids,     
++               nr_tgs * nr_cpu_ids * 2);    
++DEFINE_RESERVE(task_group,      
++               extrapad,            
++               tg,             
++               nr_tgs,     
++               nr_tgs * 2);    
+ 
+ static int sched_mempools_create(void)
+ {
+@@ -257,7 +274,10 @@ static int sched_mempools_create(void)
+ 	 * if (err = create_mempool_percpu_var())
+ 	 * 	return err;
+ 	 */
+-
++	if ((err = create_mempool_cfsrq()))
++		return err;
++	if ((err = create_mempool_tg()))
++		return err;
+ 	return 0;
+ }
+ 
+@@ -269,6 +289,9 @@ static void sched_mempools_destroy(void)
+ 	 * simple_mempool_destory(rq_smp);
+ 	 * simple_percpu_mempool_destory(percpu_var_smp);
+ 	 */
++
++	simple_mempool_destory(cfsrq_smp);
++	simple_mempool_destory(tg_smp);
+ }
+ 
+ static int recheck_smps(void)
+@@ -318,6 +341,23 @@ static void sched_alloc_extrapad(void)
+ 	 * for_each_process_thread (p, t)
+ 	 *	t->percpu_var = alloc_percpu_var_reserve();
+ 	 */
++	struct task_group *tg;
++        int cpu;
++
++        list_for_each_entry_rcu(tg, &task_groups, list) {
++           tg->extrapad = alloc_tg_reserve();
++		    ((struct tg_pad *)tg->extrapad)->test1 = -123;
++		    ((struct tg_pad *)tg->extrapad)->test2 = 456;
++		    memcpy(((struct tg_pad *)tg->extrapad)->test3, "Hello", 5);
++	        ((struct tg_pad *)tg->extrapad)->test4 = NULL;
++		    for_each_possible_cpu(cpu) {
++               tg->cfs_rq[cpu]->extrapad = alloc_cfsrq_reserve();
++               ((struct cfsrq_pad *)tg->cfs_rq[cpu]->extrapad)->test1 = -123;
++               ((struct cfsrq_pad *)tg->cfs_rq[cpu]->extrapad)->test2 = 456;
++               memcpy(((struct cfsrq_pad *)tg->cfs_rq[cpu]->extrapad)->test3, "Hello", 5);
++               ((struct cfsrq_pad *)tg->cfs_rq[cpu]->extrapad)->test4 = NULL;
++           }
++        }
+ }
+ 
+ static void sched_free_extrapad(void)
+@@ -347,6 +387,14 @@ static void sched_free_extrapad(void)
+ 	 * for_each_process_thread(p, t)
+ 	 * 	release_percpu_var_reserve(t);
+ 	 */
++	     struct task_group *tg;
++        int cpu;
++
++        list_for_each_entry_rcu(tg, &task_groups, list) {
++           release_tg_reserve(&tg->extrapad);
++		    for_each_possible_cpu(cpu)
++               release_cfsrq_reserve(&tg->cfs_rq[cpu]->extrapad);
++        }
+ }
+ 
+ #else
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 09aa58fa9..d76f5c1df 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -402,7 +402,7 @@ struct task_group {
+ 	struct cfs_bandwidth	cfs_bandwidth;
+ 
+ 	ALI_HOTFIX_RESERVE(1)
+-	ALI_HOTFIX_RESERVE(2)
++	void			*extrapad;
+ };
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+@@ -581,7 +581,7 @@ struct cfs_rq {
+ 	ALI_HOTFIX_RESERVE(1)
+ 	ALI_HOTFIX_RESERVE(2)
+ 	ALI_HOTFIX_RESERVE(3)
+-	ALI_HOTFIX_RESERVE(4)
++	void			*extrapad;
+ };
+ 
+ static inline int rt_bandwidth_enabled(void)
+-- 
+2.27.0
+
